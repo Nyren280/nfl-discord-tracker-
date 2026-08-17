@@ -1,0 +1,29 @@
+name: NFL Scoreboard Bot
+
+on:
+  schedule:
+    - cron: '0 17,20,23,2 * * 0,1'
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Dependencies
+        run: pip install requests
+
+      - name: Run Tracker
+        env:
+          DISCORD_WEBHOOK_SAINTS: ${{ secrets.DISCORD_WEBHOOK_SAINTS }}
+          DISCORD_WEBHOOK_PANTHERS: ${{ secrets.DISCORD_WEBHOOK_PANTHERS }}
+          DISCORD_ROLE_SAINTS: ${{ secrets.DISCORD_ROLE_SAINTS }}
+          DISCORD_ROLE_PANTHERS: ${{ secrets.DISCORD_ROLE_PANTHERS }}
+        run: python nfl_tracker.py

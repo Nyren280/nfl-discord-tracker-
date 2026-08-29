@@ -1,146 +1,148 @@
 import os
-import json
 import requests
 
-# ── CACHE STATE FILE SETUP ────────────────────────────────────
-CACHE_FILE = "sent_scores.json"
-
-if os.path.exists(CACHE_FILE):
-    try:
-        with open(CACHE_FILE, "r") as f:
-            sent_games = json.load(f)
-    except Exception as e:
-        print(f"⚠️ Error reading cache file: {e}. Starting fresh.")
-        sent_games = {}
-else:
-    sent_games = {}
-
-# ── TEAM CONFIGURATION ────────────────────────────────────────
 TEAMS = {
     "NO": {
-        "webhook": os.getenv("DISCORD_WEBHOOK_NO"),
-        "role_id": os.getenv("DISCORD_ROLE_NO"),
+        "webhook": os.getenv("DISCORD_WEBHOOK_SAINTS"),
+        "role_id": os.getenv("DISCORD_ROLE_SAINTS"),
         "color": 13408563,  # Gold
-        "name": "New Orleans Saints"
+        "name": "New Orleans Saints",
+        "alt_name": "New Orleans Saints"
     },
     "CAR": {
-        "webhook": os.getenv("DISCORD_WEBHOOK_CAR"),
-        "role_id": os.getenv("DISCORD_ROLE_CAR"),
-        "color": 15403,     # Blue/Black
-        "name": "Carolina Panthers"
+        "webhook": os.getenv("DISCORD_WEBHOOK_PANTHERS"),
+        "role_id": os.getenv("DISCORD_ROLE_PANTHERS"),
+        "color": 15403,     # Panther Blue
+        "name": "Carolina Panthers",
+        "alt_name": "Carolina Panthers"
     }
 }
 
-ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+PRIMARY_ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+FALLBACK_SPORTSDB_URL = "https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d=today&s=American_Football"
 
-
-def fetch_and_process_scores():
-    try:
-        response = requests.get(ESPN_URL, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:
-        print(f"❌ Failed to fetch ESPN data: {e}")
-        return
-
+def fetch_espn_data():
+    """Primary fetcher: ESPN API"""
+    print("Fetching scores from primary source (ESPN)...")
+    res = requests.get(PRIMARY_ESPN_URL, timeout=8)
+    if res.status_code != 200:
+        raise Exception(f"ESPN returned HTTP {res.status_code}")
+    
+    data = res.json()
     events = data.get("events", [])
-    if not events:
-        print("ℹ️ No NFL events found in feed.")
-        return
-
-    cache_updated = False
-
+    updates = []
+    
     for event in events:
-        game_id = event.get("id")
-        status_data = event.get("status", {}).get("type", {})
-        status_name = status_data.get("name", "")  # e.g., "STATUS_FINAL"
-        status_detail = status_data.get("detail", "Final")  # e.g., "Final" or "Final/OT"
-
-        # We only want to trigger automatic updates for finished games
-        if status_name != "STATUS_FINAL":
+        competitions = event.get("competitions", [])
+        if not competitions:
             continue
+        competitors = competitions[0].get("competitors", [])
+        
+        for team in competitors:
+            abbrev = team.get("team", {}).get("abbreviation")
+            if abbrev in TEAMS:
+                home = next((c for c in competitors if c.get("homeAway") == "home"), {})
+                away = next((c for c in competitors if c.get("homeAway") == "away"), {})
+                status = event.get("status", {}).get("type", {}).get("detail", "Scheduled")
+                
+                updates.append({
+                    "abbrev": abbrev,
+                    "away_name": away.get('team', {}).get('displayName', 'Away'),
+                    "away_score": away.get('score', '0'),
+                    "home_name": home.get('team', {}).get('displayName', 'Home'),
+                    "home_score": home.get('score', '0'),
+                    "status": status,
+                    "source": "ESPN API"
+                })
+    return updates
 
-        competitors = event.get("competitions", [{}])[0].get("competitors", [])
-        if not competitors:
-            continue
+def fetch_sportsdb_fallback():
+    """Secondary fetcher: TheSportsDB"""
+    print("⚠️ Primary API down or empty. Swapping to fallback (TheSportsDB)...")
+    res = requests.get(FALLBACK_SPORTSDB_URL, timeout=8)
+    if res.status_code != 200:
+        raise Exception(f"TheSportsDB returned HTTP {res.status_code}")
+        
+    data = res.json()
+    events = data.get("events") or []
+    updates = []
+    
+    for event in events:
+        home_team = event.get("strHomeTeam", "")
+        away_team = event.get("strAwayTeam", "")
+        
+        for abbrev, cfg in TEAMS.items():
+            if cfg["alt_name"] in [home_team, away_team]:
+                updates.append({
+                    "abbrev": abbrev,
+                    "away_name": away_team,
+                    "away_score": event.get("intAwayScore", "0") or "0",
+                    "home_name": home_team,
+                    "home_score": event.get("intHomeScore", "0") or "0",
+                    "status": event.get("strStatus", "Scheduled"),
+                    "source": "TheSportsDB (Fallback)"
+                })
+    return updates
 
-        # Extract team abbreviation, score, and home/away status
-        team_data = {}
-        for comp in competitors:
-            abbrev = comp.get("team", {}).get("abbreviation")
-            score = comp.get("score", "0")
-            home_away = comp.get("homeAway")
-            team_data[abbrev] = {"score": score, "homeAway": home_away}
-
-        # Check if any configured team played in this game
-        for team_code, team_info in TEAMS.items():
-            if team_code in team_data:
-                webhook_url = team_info["webhook"]
-                if not webhook_url:
-                    print(f"⚠️ Webhook missing for {team_code}. Skipping.")
-                    continue
-
-                # Unique key per team, game ID, and status state
-                cache_key = f"{team_code}_{game_id}_{status_name}"
-
-                # 🛑 DUP GUARD: Skip if already posted to Discord
-                if sent_games.get(cache_key):
-                    print(f"⏩ Skipping {cache_key} — score update already sent.")
-                    continue
-
-                # Identify opponent
-                opponent_code = [k for k in team_data.keys() if k != team_code]
-                opponent_str = opponent_code[0] if opponent_code else "OPP"
-
-                # Build Matchup Title (e.g. CAR @ BUF or JAX @ NO)
-                if team_data[team_code]["homeAway"] == "home":
-                    matchup_str = f"{opponent_str} @ {team_code}"
-                else:
-                    matchup_str = f"{team_code} @ {opponent_str}"
-
-                # Build Score Line (e.g. CAR: 14 | BUF: 29)
-                away_team = next((k for k, v in team_data.items() if v["homeAway"] == "away"), team_code)
-                home_team = next((k for k, v in team_data.items() if v["homeAway"] == "home"), opponent_str)
-                score_str = f"{away_team}: **{team_data.get(away_team, {}).get('score', '0')}** | {home_team}: **{team_data.get(home_team, {}).get('score', '0')}**"
-
-                role_ping = f"<@&{team_info['role_id']}>" if team_info.get("role_id") else ""
-
-                payload = {
-                    "username": f"{team_info['name']} Bot",
-                    "content": role_ping,
-                    "allowed_mentions": {"roles": [team_info["role_id"]] if team_info.get("role_id") else []},
-                    "embeds": [
-                        {
-                            "title": f"🏈 {team_info['name']} Game Update",
-                            "color": team_info["color"],
-                            "fields": [
-                                {"name": "Matchup", "value": matchup_str, "inline": False},
-                                {"name": "Score", "value": score_str, "inline": False},
-                                {"name": "Status", "value": status_detail, "inline": False}
-                            ],
-                            "footer": {"text": "Automated NFL Live Score Tracker"}
-                        }
-                    ]
+def send_discord_update(update):
+    cfg = TEAMS[update["abbrev"]]
+    if not cfg["webhook"]:
+        print(f"Skipping {update['abbrev']} — missing Webhook URL.")
+        return
+        
+    role_ping = f"<@&{cfg['role_id']}>" if cfg["role_id"] else ""
+    payload = {
+        "content": role_ping,
+        "allowed_mentions": {"roles": [cfg["role_id"]] if cfg["role_id"] else []},
+        "embeds": [{
+            "title": f"🏈 {cfg['name']} Game Update",
+            "color": cfg["color"],
+            "fields": [
+                {
+                    "name": "Matchup",
+                    "value": f"**{update['away_name']}** @ **{update['home_name']}**",
+                    "inline": False
+                },
+                {
+                    "name": "Score",
+                    "value": f"{update['away_name']}: **{update['away_score']}** | {update['home_name']}: **{update['home_score']}**",
+                    "inline": True
+                },
+                {
+                    "name": "Status",
+                    "value": update["status"],
+                    "inline": True
                 }
+            ],
+            "footer": {"text": f"Automated Live Tracker • Source: {update['source']}"}
+        }]
+    }
+    
+    res = requests.post(cfg["webhook"], json=payload)
+    print(f"Sent update for {update['abbrev']} via {update['source']}. HTTP {res.status_code}")
 
-                # Send Webhook
-                try:
-                    res = requests.post(webhook_url, json=payload, timeout=10)
-                    if res.status_code in [200, 204]:
-                        print(f"✅ Posted update for {cache_key}")
-                        sent_games[cache_key] = True
-                        cache_updated = True
-                    else:
-                        print(f"❌ Discord error {res.status_code}: {res.text}")
-                except Exception as post_err:
-                    print(f"🚨 Failed to send webhook: {post_err}")
+def run():
+    updates = []
+    
+    # Try ESPN first
+    try:
+        updates = fetch_espn_data()
+    except Exception as e:
+        print(f"ESPN API Failed: {e}")
+        
+    # If ESPN returned no game updates or hit an exception, fall back to TheSportsDB
+    if not updates:
+        try:
+            updates = fetch_sportsdb_fallback()
+        except Exception as e:
+            print(f"Fallback API also failed: {e}")
 
-    # Write updated cache to file if new scores were posted
-    if cache_updated:
-        with open(CACHE_FILE, "w") as f:
-            json.dump(sent_games, f, indent=2)
-        print("💾 Saved sent_scores.json cache.")
-
+    # Post to Discord if any updates were retrieved
+    if updates:
+        for update in updates:
+            send_discord_update(update)
+    else:
+        print("No active games found for Saints or Panthers on either API.")
 
 if __name__ == "__main__":
-    fetch_and_process_scores()
+    run()

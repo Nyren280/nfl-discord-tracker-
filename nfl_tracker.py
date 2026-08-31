@@ -22,7 +22,7 @@ PRIMARY_ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/s
 FALLBACK_SPORTSDB_URL = "https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d=today&s=American_Football"
 
 def fetch_espn_data():
-    """Primary fetcher: ESPN API"""
+    """Primary fetcher: ESPN API (Only live or completed games)"""
     print("Fetching scores from primary source (ESPN)...")
     res = requests.get(PRIMARY_ESPN_URL, timeout=8)
     if res.status_code != 200:
@@ -33,6 +33,14 @@ def fetch_espn_data():
     updates = []
     
     for event in events:
+        status_info = event.get("status", {}).get("type", {})
+        game_state = status_info.get("state", "").lower()  # 'pre', 'in', or 'post'
+        
+        # IGNORE SCHEDULED / PRE-GAME MATCHUPS TO PREVENT OVER-PINGING
+        if game_state == "pre":
+            print(f"Skipping scheduled event: {event.get('name')}")
+            continue
+
         competitions = event.get("competitions", [])
         if not competitions:
             continue
@@ -43,7 +51,7 @@ def fetch_espn_data():
             if abbrev in TEAMS:
                 home = next((c for c in competitors if c.get("homeAway") == "home"), {})
                 away = next((c for c in competitors if c.get("homeAway") == "away"), {})
-                status = event.get("status", {}).get("type", {}).get("detail", "Scheduled")
+                status_detail = status_info.get("detail", "Live")
                 
                 updates.append({
                     "abbrev": abbrev,
@@ -51,13 +59,13 @@ def fetch_espn_data():
                     "away_score": away.get('score', '0'),
                     "home_name": home.get('team', {}).get('displayName', 'Home'),
                     "home_score": home.get('score', '0'),
-                    "status": status,
+                    "status": status_detail,
                     "source": "ESPN API"
                 })
     return updates
 
 def fetch_sportsdb_fallback():
-    """Secondary fetcher: TheSportsDB"""
+    """Secondary fetcher: TheSportsDB (Only live or completed games)"""
     print("⚠️ Primary API down or empty. Swapping to fallback (TheSportsDB)...")
     res = requests.get(FALLBACK_SPORTSDB_URL, timeout=8)
     if res.status_code != 200:
@@ -68,6 +76,11 @@ def fetch_sportsdb_fallback():
     updates = []
     
     for event in events:
+        status = event.get("strStatus", "").lower()
+        # Ignore future/unstarted events from fallback
+        if "not started" in status or "scheduled" in status:
+            continue
+
         home_team = event.get("strHomeTeam", "")
         away_team = event.get("strAwayTeam", "")
         
@@ -79,7 +92,7 @@ def fetch_sportsdb_fallback():
                     "away_score": event.get("intAwayScore", "0") or "0",
                     "home_name": home_team,
                     "home_score": event.get("intHomeScore", "0") or "0",
-                    "status": event.get("strStatus", "Scheduled"),
+                    "status": event.get("strStatus", "Live"),
                     "source": "TheSportsDB (Fallback)"
                 })
     return updates
@@ -124,25 +137,22 @@ def send_discord_update(update):
 def run():
     updates = []
     
-    # Try ESPN first
     try:
         updates = fetch_espn_data()
     except Exception as e:
         print(f"ESPN API Failed: {e}")
         
-    # If ESPN returned no game updates or hit an exception, fall back to TheSportsDB
     if not updates:
         try:
             updates = fetch_sportsdb_fallback()
         except Exception as e:
             print(f"Fallback API also failed: {e}")
 
-    # Post to Discord if any updates were retrieved
     if updates:
         for update in updates:
             send_discord_update(update)
     else:
-        print("No active games found for Saints or Panthers on either API.")
+        print("No active or completed games found for Saints or Panthers today.")
 
 if __name__ == "__main__":
     run()
